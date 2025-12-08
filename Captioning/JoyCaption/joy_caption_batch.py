@@ -1,356 +1,393 @@
-#!/usr/bin/env python3
-"""
-Joy Caption Batch Processing Script
-Processes all images in a directory and generates caption files using JoyCaption model.
-Optimized for H100 performance.
-"""
+#!/bin/bash
+set -e  # Exit immediately if a command exits with a non-zero status
 
-import os
-import argparse
-import logging
-from pathlib import Path
-from PIL import Image
-import torch
-import gc
-import threading
-from typing import Optional
+# Script configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/joy_caption_env"
+PYTHON_SCRIPT="$SCRIPT_DIR/joy_caption_batch.py"
+REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
+
+# Default image directory detection
+detect_default_image_dir() {
+    # First check if NETWORK_VOLUME is set
+    if [[ -n "$NETWORK_VOLUME" && -d "$NETWORK_VOLUME/image-dataset" ]]; then
+        echo "$NETWORK_VOLUME/image-dataset"
+    # Check for workspace volume
+    elif [[ -d "/workspace/diffusion-pipe-main/image-dataset" ]]; then
+        echo "/workspace/diffusion-pipe-main/image-dataset"
+    # Check for local volume
+    elif [[ -d "/diffusion-pipe-main/image-dataset" ]]; then
+        echo "/diffusion-pipe-main/image-dataset"
+    # Fallback to current directory
+    else
+        echo "."
+    fi
+}
+
+DEFAULT_IMAGE_DIR=$(detect_default_image_dir)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Function to show usage
+show_help() {
+    echo "Joy Caption Batch Processing Wrapper"
+    echo ""
+    echo "This script sets up a virtual environment and runs the Joy Caption batch processor."
+    echo ""
+    echo "Usage: $0 [INPUT_DIR] [OPTIONS]"
+    echo ""
+    echo "Optional:"
+    echo "  INPUT_DIR                    Directory containing images to process"
+    echo "                              (default: $DEFAULT_IMAGE_DIR)"
+    echo ""
+    echo "Options:"
+    echo "  --output-dir DIR             Directory to save caption files (default: same as input)"
+    echo "  --prompt TEXT                Caption generation prompt (default: Write a descriptive caption for this image in a casual tone within 50 words. Do NOT mention any text that is in the image."
+    echo "  --trigger-word WORD          Trigger word to prepend to captions (e.g., 'Alice' -> 'Alice, <caption>')"
+    echo "  --no-skip-existing           Process all images even if caption files already exist"
+    echo "  --setup-only                 Only setup the environment, don't run captioning"
+    echo "  --force-reinstall            Force reinstall of all requirements"
+    echo "  -h, --help                   Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                           # Use default image directory: $DEFAULT_IMAGE_DIR"
+    echo "  $0 /path/to/images"
+    echo "  $0 --trigger-word 'claude' --output-dir /path/to/captions"
+    echo "  $0 /path/to/images --prompt 'Describe this image in detail.' --timeout 10"
+    echo "  $0 --setup-only              # Just setup the environment"
+    echo ""
+    echo "Default image directory detection:"
+    echo "  1. \$NETWORK_VOLUME/image_dataset_here (if NETWORK_VOLUME is set)"
+    echo "  2. /workspace/diffusion_pipe_working_folder/image_dataset_here"
+    echo "  3. /diffusion_pipe_working_folder/image_dataset_here"
+    echo "  4. Current directory (.)"
+}
+
+# Function to install system dependencies
+install_system_deps() {
+    log_info "Checking system dependencies..."
+
+    # Check if we need to install python3-venv
+    if ! dpkg -l | grep -q python3-venv 2>/dev/null; then
+        log_info "Installing required system packages..."
+
+        # Update package list
+        if command -v apt &> /dev/null; then
+            log_info "Updating package list..."
+            apt update || {
+                log_warning "Failed to update package list. Continuing anyway..."
+            }
+
+            log_info "Installing python3-venv..."
+            apt install -y python3-venv || {
+                log_error "Failed to install python3-venv. You may need to run this script as root or with sudo."
+                exit 1
+            }
+            log_success "System dependencies installed"
+        else
+            log_warning "apt package manager not found. Assuming dependencies are available."
+        fi
+    else
+        log_info "System dependencies already installed"
+    fi
+}
+
+# Function to check if Python 3.8+ is available
+check_python() {
+    if command -v python3 &> /dev/null; then
+        PYTHON_CMD="python3"
+    elif command -v python &> /dev/null; then
+        PYTHON_CMD="python"
+    else
+        log_error "Python is not installed or not in PATH"
+        exit 1
+    fi
+
+    # Check Python version
+    PYTHON_VERSION=$($PYTHON_CMD -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    REQUIRED_VERSION="3.8"
+
+    if ! $PYTHON_CMD -c "import sys; exit(0 if sys.version_info >= (3, 8) else 1)" 2>/dev/null; then
+        log_error "Python 3.8 or higher is required. Found: $PYTHON_VERSION"
+        exit 1
+    fi
+
+    log_info "Using Python $PYTHON_VERSION: $($PYTHON_CMD --version)"
+}
+
+# Function to create requirements.txt if it doesn't exist
+create_requirements() {
+    if [[ ! -f "$REQUIREMENTS_FILE" ]]; then
+        log_info "Creating requirements.txt file..."
+        cat > "$REQUIREMENTS_FILE" << 'EOF'
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+accelerate>=0.20.0
+Pillow>=9.0.0
+numpy>=1.21.0
+safetensors>=0.3.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+EOF
+        log_success "Created requirements.txt"
+    fi
+}
+
+# Function to setup virtual environment
+setup_venv() {
+    log_info "Setting up virtual environment..."
+
+    # Remove existing venv if force reinstall is requested
+    if [[ "$FORCE_REINSTALL" == "true" && -d "$VENV_DIR" ]]; then
+        log_warning "Removing existing virtual environment for fresh install..."
+        rm -rf "$VENV_DIR"
+    fi
+
+    # Check if venv exists and is valid
+    if [[ -d "$VENV_DIR" ]]; then
+        if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+            log_warning "Virtual environment appears corrupted (missing activate script)"
+            log_info "Removing corrupted virtual environment..."
+            rm -rf "$VENV_DIR"
+        else
+            log_info "Virtual environment already exists and appears valid"
+        fi
+    fi
+
+    # Create virtual environment if it doesn't exist or was removed
+    if [[ ! -d "$VENV_DIR" ]]; then
+        log_info "Creating virtual environment at $VENV_DIR"
+        $PYTHON_CMD -m venv "$VENV_DIR"
+
+        # Verify creation was successful
+        if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+            log_error "Failed to create virtual environment properly"
+            log_error "The activate script was not created"
+            exit 1
+        fi
+
+        log_success "Virtual environment created successfully"
+    fi
+
+    # Activate virtual environment
+    source "$VENV_DIR/bin/activate"
+
+    # Upgrade pip
+    log_info "Upgrading pip..."
+    pip install --upgrade pip
+
+    # Install or upgrade requirements
+    if [[ "$FORCE_REINSTALL" == "true" ]]; then
+        log_info "Force reinstalling requirements..."
+        pip install --force-reinstall -r "$REQUIREMENTS_FILE"
+    else
+        log_info "Installing requirements..."
+        pip install -r "$REQUIREMENTS_FILE"
+    fi
+
+    log_success "Virtual environment setup complete"
+}
+
+# Function to check if the Python script exists
+check_python_script() {
+    if [[ ! -f "$PYTHON_SCRIPT" ]]; then
+        log_error "Python script not found: $PYTHON_SCRIPT"
+        log_error "Please ensure joy_caption_batch.py is in the same directory as this script"
+        exit 1
+    fi
+}
+
+# Function to run the captioning script
+run_captioning() {
+    log_info "Activating virtual environment and running Joy Caption batch processor..."
+
+    # Activate virtual environment
+    source "$VENV_DIR/bin/activate"
+
+    # Build command with all passed arguments
+    CMD="python \"$PYTHON_SCRIPT\""
+
+    # Add all arguments passed to this script
+    for arg in "$@"; do
+        CMD="$CMD \"$arg\""
+    done
+
+    log_info "Running command: $CMD"
+
+    # Execute the command
+    eval $CMD
+
+    log_success "Joy Caption processing completed"
+}
+
+# Parse command line arguments
+SETUP_ONLY=false
+FORCE_REINSTALL=false
+SCRIPT_ARGS=()
+INPUT_DIR_SPECIFIED=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --setup-only)
+            SETUP_ONLY=true
+            shift
+            ;;
+        --force-reinstall)
+            FORCE_REINSTALL=true
+            shift
+            ;;
+        --output-dir|--prompt|--trigger-word|--timeout)
+            # These are options that take values, add both the option and its value
+            SCRIPT_ARGS+=("$1")
+            shift
+            if [[ $# -gt 0 ]]; then
+                SCRIPT_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        --no-skip-existing)
+            # This is a flag option
+            SCRIPT_ARGS+=("$1")
+            shift
+            ;;
+        *)
+            # Check if this looks like a directory path (first positional argument)
+            if [[ ! "$INPUT_DIR_SPECIFIED" == "true" && ! "$1" =~ ^-- ]]; then
+                INPUT_DIR_SPECIFIED=true
+                SCRIPT_ARGS+=("$1")
+            else
+                SCRIPT_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Main execution
+main() {
+    log_info "Starting Joy Caption Batch Processing Setup"
+
+    # Install system dependencies first
+    install_system_deps
+
+    # Check Python installation
+    check_python
+
+    # CUDA compatibility check
+    check_cuda_compatibility() {
+        $PYTHON_CMD << 'PYTHON_EOF'
 import sys
+try:
+    import torch
+    if torch.cuda.is_available():
+        # Try a simple CUDA operation to test kernel compatibility
+        x = torch.randn(1, device='cuda')
+        y = x * 2
+        print("CUDA compatibility check passed")
+    else:
+        print("\n" + "="*70)
+        print("CUDA NOT AVAILABLE")
+        print("="*70)
+        print("\nCUDA is not available on this system.")
+        print("This script requires CUDA to run.")
+        print("\nSOLUTION:")
+        print("  Please deploy with CUDA 12.8 when selecting your GPU on RunPod")
+        print("  This template requires CUDA 12.8")
+        print("\n" + "="*70)
+        sys.exit(1)
+except RuntimeError as e:
+    error_msg = str(e).lower()
+    if "no kernel image" in error_msg or "cuda error" in error_msg:
+        print("\n" + "="*70)
+        print("CUDA KERNEL COMPATIBILITY ERROR")
+        print("="*70)
+        print("\nThis error occurs when your GPU architecture is not supported")
+        print("by the installed CUDA kernels. This typically happens when:")
+        print("  • Your GPU model is older or different from what was expected")
+        print("  • The PyTorch/CUDA build doesn't include kernels for your GPU")
+        print("\nSOLUTIONS:")
+        print("  1. Use a newer GPU model (recommended):")
+        print("     • H100 or H200 GPUs are recommended for best compatibility")
+        print("  2. Ensure correct CUDA version:")
+        print("     • Filter for CUDA 12.8 when selecting your GPU on RunPod")
+        print("     • This template requires CUDA 12.8")
+        print("\n" + "="*70)
+        sys.exit(1)
+    else:
+        raise
+PYTHON_EOF
+        if [ $? -ne 0 ]; then
+            exit 1
+        fi
+    }
+    
+    check_cuda_compatibility
 
-system_prompt = "Write a detailed description for this image in 50 words or less. Do NOT mention any text that is in the image."
+    # Create requirements file if needed
+    create_requirements
 
-NETWORK_VOLUME = os.getenv("NETWORK_VOLUME")
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'{NETWORK_VOLUME}/logs/joy_caption_batch.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+    # Setup virtual environment
+    setup_venv
 
+    # If setup-only flag is set, exit here
+    if [[ "$SETUP_ONLY" == "true" ]]; then
+        log_success "Environment setup complete. You can now run the script normally."
+        exit 0
+    fi
 
-class JoyCaptionManager:
-    def __init__(self, timeout_minutes: int = 5):
-        self.model = None
-        self.processor = None
-        # Check CUDA availability - this script requires CUDA
-        if not torch.cuda.is_available():
-            error_message = """
-======================================================================
-CUDA NOT AVAILABLE
-======================================================================
+    # Check if Python script exists
+    check_python_script
 
-CUDA is not available on this system.
-This script requires CUDA to run.
+    # If no input directory was specified, use the default
+    if [[ "$INPUT_DIR_SPECIFIED" == "false" ]]; then
+        log_info "No input directory specified, using default: $DEFAULT_IMAGE_DIR"
 
-SOLUTION:
-  Please deploy with CUDA 12.8 when selecting your GPU on RunPod
-  This template requires CUDA 12.8
+        # Check if the default directory exists
+        if [[ ! -d "$DEFAULT_IMAGE_DIR" ]]; then
+            log_warning "Default image directory does not exist: $DEFAULT_IMAGE_DIR"
+            log_info "Creating directory: $DEFAULT_IMAGE_DIR"
+            mkdir -p "$DEFAULT_IMAGE_DIR" || {
+                log_error "Failed to create directory: $DEFAULT_IMAGE_DIR"
+                exit 1
+            }
+        fi
 
-======================================================================
-"""
-            logger.error(error_message)
-            raise RuntimeError("CUDA is not available. Please deploy with CUDA 12.8.")
-        
-        self.device = "cuda"
-        self.timeout = timeout_minutes * 60
-        self.timer: Optional[threading.Timer] = None
-        self.lock = threading.Lock()
-        self.model_name = "fancyfeast/llama-joycaption-beta-one-hf-llava"
+        # Add the default directory as the first argument
+        SCRIPT_ARGS=("$DEFAULT_IMAGE_DIR" "${SCRIPT_ARGS[@]}")
+    fi
 
-    def load_model(self):
-        with self.lock:
-            if self.model is None:
-                logger.info("Loading JoyCaption model...")
-                
-                # CUDA compatibility check
-                if self.device == "cuda":
-                    try:
-                        # Try a simple CUDA operation to test kernel compatibility
-                        test_tensor = torch.randn(1, device='cuda')
-                        _ = test_tensor * 2
-                        logger.info("CUDA compatibility check passed")
-                    except RuntimeError as e:
-                        error_msg = str(e).lower()
-                        if "no kernel image" in error_msg or "cuda error" in error_msg:
-                            error_message = """
-======================================================================
-CUDA KERNEL COMPATIBILITY ERROR
-======================================================================
+    # Run the captioning script with all arguments
+    run_captioning "${SCRIPT_ARGS[@]}"
 
-This error occurs when your GPU architecture is not supported
-by the installed CUDA kernels. This typically happens when:
-  • Your GPU model is older or different from what was expected
-  • The PyTorch/CUDA build doesn't include kernels for your GPU
+    log_success "All done! 🎉"
+}
 
-SOLUTIONS:
-  1. Use a newer GPU model (recommended):
-     • H100 or H200 GPUs are recommended for best compatibility
-  2. Ensure correct CUDA version:
-     • Filter for CUDA 12.8 when selecting your GPU on RunPod
-     • This template requires CUDA 12.8
-
-======================================================================
-"""
-                            logger.error(error_message)
-                            raise RuntimeError("CUDA kernel compatibility error detected. Please use a compatible GPU.")
-                        else:
-                            raise
-                
-                try:
-                    from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-                    # Load processor
-                    logger.info("Loading processor...")
-                    self.processor = AutoProcessor.from_pretrained(
-                        self.model_name,
-                        trust_remote_code=True
-                    )
-
-                    # Load model - match working Gradio implementation exactly
-                    logger.info("Loading model...")
-                    self.model = LlavaForConditionalGeneration.from_pretrained(
-                        self.model_name,
-                        torch_dtype="bfloat16",  # Use string format like working implementation
-                        device_map=0 if self.device == "cuda" else None,  # Use specific device like working implementation
-                        trust_remote_code=True
-                    )
-
-                    # Fix missing pad_token
-                    tok = self.processor.tokenizer
-                    if tok.pad_token is None:
-                        tok.pad_token = tok.eos_token
-                        self.model.config.pad_token_id = tok.eos_token_id
-
-                    logger.info(f"Model loaded successfully on {self.device}")
-
-                except Exception as e:
-                    logger.error(f"Failed to load model: {e}")
-                    raise
-
-    def unload_model(self):
-        with self.lock:
-            if self.model is not None:
-                logger.info("Unloading model from memory...")
-                del self.model
-                del self.processor
-                self.model = None
-                self.processor = None
-
-                # Clear cache based on device
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                elif torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-
-                gc.collect()
-                logger.info("Model unloaded successfully")
-
-    def reset_timer(self):
-        if self.timer:
-            self.timer.cancel()
-        self.timer = threading.Timer(self.timeout, self.unload_model)
-        self.timer.start()
-
-    def generate_caption(self, image: Image.Image, prompt: str = system_prompt) -> str:
-        self.load_model()
-        self.reset_timer()
-
-        try:
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-
-            logging.info(f"Original prompt: {prompt}")
-
-            # Use chat template format like the working Gradio implementation
-            convo = [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt.strip(),
-                },
-            ]
-
-            # Format the conversation using chat template
-            convo_string = self.processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
-            logging.info(f"Formatted conversation: {convo_string}")
-
-            # Process inputs like the working implementation
-            inputs = self.processor(
-                text=[convo_string],
-                images=[image],
-                return_tensors="pt"
-            )
-
-            # Move inputs to device and convert pixel values to bfloat16
-            inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            if 'pixel_values' in inputs:
-                inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
-
-            logging.info("Generating caption...")
-            with torch.no_grad():
-                # Use generation parameters that match the working Gradio implementation
-                output_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    do_sample=True,
-                    temperature=0.6,  # Match working implementation
-                    top_p=0.9,        # Match working implementation
-                    top_k=None,       # Don't use top_k like working implementation
-                    suppress_tokens=None,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                    use_cache=True
-                )
-
-            input_len = inputs['input_ids'].shape[1]
-            generated_ids = output_ids[0][input_len:]
-            caption = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
-
-            logger.info(f"Generated caption: {caption}")
-            return caption
-
-        except Exception as e:
-            logger.error(f"Error in generate_caption: {e}")
-            raise
-
-
-def get_image_files(directory: Path) -> list:
-    """Get all image files from the directory (not including subdirectories)."""
-    supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
-    image_files = []
-
-    # Only check files in the immediate directory, not subdirectories
-    for file_path in directory.iterdir():
-        if file_path.is_file() and file_path.suffix.lower() in supported_formats:
-            image_files.append(file_path)
-
-    return sorted(image_files)
-
-def process_images(input_dir: str, output_dir: str = None, prompt: str = system_prompt,
-                   skip_existing: bool = True, timeout_minutes: int = 5, trigger_word: str = None):
-    """
-    Process all images in the input directory and generate captions.
-
-    Args:
-        input_dir: Directory containing images to process
-        output_dir: Directory to save caption files (defaults to same as input_dir)
-        prompt: Caption generation prompt
-        skip_existing: Skip images that already have caption files
-        timeout_minutes: Model unload timeout in minutes
-        trigger_word: Optional trigger word to prepend to generated captions
-    """
-    input_path = Path(input_dir)
-    output_path = Path(output_dir) if output_dir else input_path
-
-    if not input_path.exists():
-        logger.error(f"Input directory does not exist: {input_path}")
-        return
-
-    # Create output directory if it doesn't exist
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Get all image files
-    image_files = get_image_files(input_path)
-
-    if not image_files:
-        logger.warning(f"No image files found in {input_path}")
-        return
-
-    logger.info(f"Found {len(image_files)} image files to process")
-
-    # Initialize caption manager
-    caption_manager = JoyCaptionManager(timeout_minutes=timeout_minutes)
-
-    processed_count = 0
-    skipped_count = 0
-    error_count = 0
-
-    try:
-        for i, image_file in enumerate(image_files, 1):
-            try:
-                # Generate caption file path
-                caption_file = output_path / f"{image_file.stem}.txt"
-
-                # Skip if caption file already exists and skip_existing is True
-                if skip_existing and caption_file.exists():
-                    logger.info(f"[{i}/{len(image_files)}] Skipping {image_file.name} - caption file already exists")
-                    skipped_count += 1
-                    continue
-
-                logger.info(f"[{i}/{len(image_files)}] Processing {image_file.name}")
-
-                # Load and process image
-                with Image.open(image_file) as img:
-                    caption = caption_manager.generate_caption(img, prompt)
-
-                # Add trigger word if specified
-                if trigger_word:
-                    caption = f"{trigger_word}, {caption}"
-
-                # Save caption to file
-                with open(caption_file, 'w', encoding='utf-8') as f:
-                    f.write(caption)
-
-                logger.info(f"[{i}/{len(image_files)}] Saved caption to {caption_file.name}")
-                processed_count += 1
-
-            except Exception as e:
-                logger.error(f"[{i}/{len(image_files)}] Error processing {image_file.name}: {e}")
-                error_count += 1
-                continue
-
-    finally:
-        # Ensure model is unloaded
-        logger.info("Unloading model...")
-        caption_manager.unload_model()
-
-        # Cancel any pending timer
-        if caption_manager.timer:
-            caption_manager.timer.cancel()
-
-    # Print summary
-    logger.info("=" * 50)
-    logger.info("PROCESSING SUMMARY")
-    logger.info("=" * 50)
-    logger.info(f"Total images found: {len(image_files)}")
-    logger.info(f"Successfully processed: {processed_count}")
-    logger.info(f"Skipped (already exists): {skipped_count}")
-    logger.info(f"Errors: {error_count}")
-    logger.info("=" * 50)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Batch process images with JoyCaption')
-    parser.add_argument('input_dir', help='Directory containing images to process')
-    parser.add_argument('--output-dir', help='Directory to save caption files (defaults to input directory)')
-    parser.add_argument(
-        '--prompt',
-        default="Write a detailed description for this image in 50 words or less. Do NOT mention any text that is in the image.",
-        help='Caption generation prompt'
-    )
-    parser.add_argument('--trigger-word',
-                        help='Trigger word to prepend to generated captions (e.g., "claude" -> "claude, <caption>")')
-    parser.add_argument('--no-skip-existing', action='store_true',
-                        help='Process all images even if caption files already exist')
-    parser.add_argument('--timeout', type=int, default=5,
-                        help='Model unload timeout in minutes (default: 5)')
-
-    args = parser.parse_args()
-
-    process_images(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
-        prompt=args.prompt,
-        skip_existing=not args.no_skip_existing,
-        timeout_minutes=args.timeout,
-        trigger_word=args.trigger_word
-    )
-
-
-if __name__ == "__main__":
-    main()
+# Run main function
+main "$@"
