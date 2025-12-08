@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Determine which branch to clone based on environment variables
-BRANCH="main"  # Default branch
+BRANCH="master"  # Default branch
 
 if [ "$is_dev" == "true" ]; then
     BRANCH="dev"
@@ -10,17 +10,17 @@ elif [ -n "$git_branch" ]; then
     BRANCH="$git_branch"
     echo "Custom branch specified: $git_branch"
 else
-    echo "Using default branch: main"
+    echo "Using default branch: master"
 fi
 
 # Clone the repository to a temporary location with the specified branch
 echo "Cloning branch '$BRANCH' from repository..."
-git clone --branch "$BRANCH" https://github.com/antique3e/diffusion-pipe-helper.git /tmp/diffusion-pipe-helper
+git clone --branch "$BRANCH" https://github.com/Antique3e/diffusion-pipe-helper.git /tmp/diffusion-pipe-helper
 
 # Check if clone was successful
 if [ $? -ne 0 ]; then
     echo "Error: Failed to clone branch '$BRANCH'. Falling back to main branch..."
-    git clone https://github.com/antique3e/diffusion-pipe-helper.git /tmp/diffusion-pipe-helper
+    git clone https://github.com/Antique3e/diffusion-pipe-helper/ /tmp/diffusion-pipe-helper
 
     if [ $? -ne 0 ]; then
         echo "Error: Failed to clone repository. Exiting..."
@@ -34,19 +34,24 @@ export LD_PRELOAD="${TCMALLOC}"
 
 # Check if workspace exists and set network volume accordingly
 if [ ! -d "/workspace" ]; then
-    echo "NETWORK_VOLUME directory '/workspace' does not exist. You are NOT using a network volume. Setting NETWORK_VOLUME to '/diffusion-pipe-working-folder' (root directory)."
-    mkdir -p "/diffusion-pipe-working-folder"
-    NETWORK_VOLUME="/diffusion-pipe-working-folder"
+    echo "NETWORK_VOLUME directory '/workspace' does not exist. You are NOT using a network volume. Setting NETWORK_VOLUME to '/diffusion-pipe-main' (root directory)."
+    mkdir -p "/diffusion-pipe-main"
+    NETWORK_VOLUME="/diffusion-pipe-main"
 else
-    echo "Network volume detected at /workspace. Using /workspace/diffusion-pipe-working-folder as working directory."
-    mkdir -p "/workspace/diffusion-pipe-working-folder"
-    NETWORK_VOLUME="/workspace/diffusion-pipe-working-folder"
+    echo "Network volume detected at /workspace. Using /workspace/diffusion-pipe-main as working directory."
+    mkdir -p "/workspace/diffusion-pipe-main"
+    NETWORK_VOLUME="/workspace/diffusion-pipe-main"
 fi
 export NETWORK_VOLUME
 
 echo "cd $NETWORK_VOLUME" >> /root/.bashrc
 
+#cd "$NETWORK_VOLUME/diffusion_pipe_working_folder/diffusion-pipe" || exit 1
+#git pull || true
+#cd "$NETWORK_VOLUME" || exit 1
+
 # GPU detection for optimized flash-attn build
+# Returns architecture in FLASH_ATTN_CUDA_ARCHS format (e.g., "90" for sm_90)
 detect_cuda_arch() {
     local gpu_name
     gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | xargs)
@@ -104,6 +109,7 @@ detect_cuda_arch() {
 }
 
 # Install flash-attn
+# Strategy: Try prebuilt wheel first (fast) in foreground, fall back to building from source in background if needed
 echo "Installing flash-attn..."
 mkdir -p "$NETWORK_VOLUME/logs"
 
@@ -114,7 +120,12 @@ echo "Detected GPU: $DETECTED_GPU"
 echo "Using CUDA architecture: $CUDA_ARCH"
 
 # Specify the exact prebuilt wheel URL here
+# Get wheels from: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+# Format: flash_attn-{version}+cu{cuda}torch{torch}-cp{py}-cp{py}-linux_x86_64.whl
 FLASH_ATTN_WHEEL_URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
+
+# If no wheel URL specified, leave empty to build from source
+# Example: FLASH_ATTN_WHEEL_URL="https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.7.4+cu128torch2.7-cp312-cp312-linux_x86_64.whl"
 
 WHEEL_INSTALLED=false
 
@@ -133,6 +144,7 @@ if [ -n "$FLASH_ATTN_WHEEL_URL" ]; then
             rm -f "$WHEEL_NAME"
             echo "✅ Successfully installed flash-attn from prebuilt wheel!"
             WHEEL_INSTALLED=true
+            # Create marker file to indicate wheel was successfully installed
             touch /tmp/flash_attn_wheel_success
         else
             echo "  Wheel installation failed, will build from source."
@@ -170,6 +182,7 @@ if [ "$WHEEL_INSTALLED" = false ]; then
     (
         set -e
         
+        # Detect GPU for optimized build
         DETECTED_GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | xargs)
         CUDA_ARCH=$(detect_cuda_arch)
         
@@ -177,11 +190,13 @@ if [ "$WHEEL_INSTALLED" = false ]; then
         echo "  GPU: $DETECTED_GPU"
         echo "  CUDA Architecture: sm_$CUDA_ARCH"
         
+        # Ensure ninja is installed for fast builds
         pip install ninja packaging -q
         if ! ninja --version > /dev/null 2>&1; then
             pip uninstall -y ninja && pip install ninja
         fi
         
+        # Build from source
         cd /tmp
         rm -rf flash-attention
         
@@ -189,6 +204,7 @@ if [ "$WHEEL_INSTALLED" = false ]; then
         git clone https://github.com/Dao-AILab/flash-attention.git
         cd flash-attention
         
+        # Set build optimization environment variables
         export FLASH_ATTN_CUDA_ARCHS="$CUDA_ARCH"
         export MAX_JOBS=$OPTIMAL_JOBS
         export NVCC_THREADS=4
@@ -200,6 +216,7 @@ if [ "$WHEEL_INSTALLED" = false ]; then
         
         python setup.py install
         
+        # Clean up
         cd /tmp
         rm -rf flash-attention
         
@@ -213,19 +230,16 @@ if [ "$WHEEL_INSTALLED" = false ]; then
 fi
 
 # Start Jupyter Lab with the working folder as the root directory
+# This puts users directly in their working environment and hides system files
 jupyter-lab --ip=0.0.0.0 --allow-root --no-browser \
     --NotebookApp.token='' --NotebookApp.password='' \
     --ServerApp.allow_origin='*' --ServerApp.allow_credentials=True \
     --notebook-dir="$NETWORK_VOLUME" &
 
-# Copy helper files to working directory from cloned repository
+# Move repository files to the working directory
 if [ -d "/tmp/diffusion-pipe-helper" ]; then
-    echo "Moving helper files from repository to working directory..."
-    
     # Move the entire repository to working directory
     mv /tmp/diffusion-pipe-helper "$NETWORK_VOLUME/"
-    
-    # Move folders to root of working directory
     mv "$NETWORK_VOLUME/diffusion-pipe-helper/Captioning" "$NETWORK_VOLUME/"
     mv "$NETWORK_VOLUME/diffusion-pipe-helper/wan2.2_lora_training" "$NETWORK_VOLUME/"
     
@@ -233,78 +247,80 @@ if [ -d "/tmp/diffusion-pipe-helper" ]; then
     if [ "$IS_DEV" == "true" ]; then
         mv "$NETWORK_VOLUME/diffusion-pipe-helper/qwen_image_musubi_training" "$NETWORK_VOLUME/" 2>/dev/null || true
     fi
-    
-    # Move src folder
-    # if [ -d "$NETWORK_VOLUME/diffusion-pipe-helper/src" ]; then
-    #     mv "$NETWORK_VOLUME/diffusion-pipe-helper/src" "$NETWORK_VOLUME/"
-    # fi
-    
-    # Set up send_lora.sh script
-    if [ -f "$NETWORK_VOLUME/src/send_lora.sh" ]; then
-        chmod +x "$NETWORK_VOLUME/src/send_lora.sh"
-        cp "$NETWORK_VOLUME/src/send_lora.sh" /usr/local/bin/
+
+
+    # Move diffusion_pipe if it exists in root to working directory
+    if [ -d "/diffusion-pipe" ]; then
+        mv /diffusion-pipe "$NETWORK_VOLUME/"
     fi
+
+    # Set up directory structure
+    DIFF_PIPE_DIR="$NETWORK_VOLUME/diffusion-pipe"
     
+    # Pull latest changes from diffusion_pipe repository
+    if [ -d "$DIFF_PIPE_DIR" ] && [ -d "$DIFF_PIPE_DIR/.git" ]; then
+        echo "Pulling latest changes from diffusion-pipe repository..."
+        cd "$DIFF_PIPE_DIR" || exit 1
+        git pull || echo "Warning: Failed to pull latest changes from diffusion-pipe repository"
+        cd "$NETWORK_VOLUME" || exit 1
+    else
+        echo "Warning: diffusion-pipe directory not found or not a git repository. Skipping git pull."
+    fi
+
+
+    echo "Updating TOML file paths..."
+    TOML_DIR="$NETWORK_VOLUME/diffusion-pipe-helper/toml_files"
+    if [ -d "$TOML_DIR" ]; then
+        # Update paths in TOML files to use NETWORK_VOLUME
+        for toml_file in "$TOML_DIR"/*.toml; do
+            if [ -f "$toml_file" ]; then
+                echo "Processing: $(basename "$toml_file")"
+                # Create backup
+                cp "$toml_file" "$toml_file.backup"
+
+                # Update various path patterns - replace absolute paths with NETWORK_VOLUME paths
+                sed -i "s|diffusers_path = '/models/|diffusers_path = '$NETWORK_VOLUME/models/|g" "$toml_file"
+                sed -i "s|ckpt_path = '/Wan/|ckpt_path = '$NETWORK_VOLUME/models/Wan/|g" "$toml_file"
+                sed -i "s|checkpoint_path = '/models/|checkpoint_path = '$NETWORK_VOLUME/models/|g" "$toml_file"
+                sed -i "s|output_dir = '/data/|output_dir = '$NETWORK_VOLUME/training-outputs/|g" "$toml_file"
+                sed -i "s|output_dir = '/training_outputs/|output_dir = '$NETWORK_VOLUME/training-outputs/|g" "$toml_file"
+
+                # Handle commented paths too
+                sed -i "s|#transformer_path = '/models/|#transformer_path = '$NETWORK_VOLUME/models/|g" "$toml_file"
+
+                # Z-Image model paths
+                sed -i "s|diffusion_model = '/models/|diffusion_model = '$NETWORK_VOLUME/models/|g" "$toml_file"
+                sed -i "s|vae = '/models/|vae = '$NETWORK_VOLUME/models/|g" "$toml_file"
+                sed -i "s|{path = '/models/|{path = '$NETWORK_VOLUME/models/|g" "$toml_file"
+                sed -i "s|merge_adapters = \['/models/|merge_adapters = ['$NETWORK_VOLUME/models/|g" "$toml_file"
+
+                echo "Updated paths in: $(basename "$toml_file")"
+            fi
+        done
+    fi
+
     # Move training scripts and utilities
-    if [ -f "$NETWORK_VOLUME/diffusion-pipe-helper/interactive_start_training.py" ]; then
-        mv "$NETWORK_VOLUME/diffusion-pipe-helper/interactive_start_training.py" "$NETWORK_VOLUME/"
-        chmod +x "$NETWORK_VOLUME/interactive_start_training.py"
-    fi
-    
     if [ -f "$NETWORK_VOLUME/diffusion-pipe-helper/start_training.sh" ]; then
         mv "$NETWORK_VOLUME/diffusion-pipe-helper/start_training.sh" "$NETWORK_VOLUME/"
         chmod +x "$NETWORK_VOLUME/start_training.sh"
     fi
-    
+
     if [ -f "$NETWORK_VOLUME/diffusion-pipe-helper/HowToUse.txt" ]; then
         mv "$NETWORK_VOLUME/diffusion-pipe-helper/HowToUse.txt" "$NETWORK_VOLUME/"
     fi
-    
-    # Move toml_files folder (no path updates - already hardcoded)
-    # if [ -d "$NETWORK_VOLUME/diffusion-pipe-helper/toml_files" ]; then
-    #     echo "Moving TOML files..."
-    #     mv "$NETWORK_VOLUME/diffusion-pipe-helper/toml_files" "$NETWORK_VOLUME/"
-    # fi
 
-    # Move toml_files folder and create backups (no path updates - already hardcoded)
-    if [ -d "$NETWORK_VOLUME/diffusion-pipe-helper/toml_files" ]; then
-        echo "Moving TOML files..."
-        mv "$NETWORK_VOLUME/diffusion-pipe-helper/toml_files" "$NETWORK_VOLUME/"
-        
-        # Create backup of each TOML file
-        for toml_file in "$NETWORK_VOLUME/toml_files"/*.toml; do
-            if [ -f "$toml_file" ]; then
-                cp "$toml_file" "$toml_file.backup"
-                echo "Created backup: $(basename "$toml_file").backup"
-            fi
-        done
+    # Set up send_lora.sh script
+    if [ -f "$NETWORK_VOLUME/diffusion-pipe/send_lora.sh" ]; then
+        chmod +x "$NETWORK_VOLUME/diffusion-pipe/send_lora.sh"
+        cp "$NETWORK_VOLUME/diffusion-pipe/send_lora.sh" /usr/local/bin/
     fi
-fi
 
-# Move diffusion_pipe if it exists in root to working directory
-if [ -d "/diffusion_pipe" ]; then
-    echo "Moving diffusion_pipe from root to working directory..."
-    mv /diffusion_pipe "$NETWORK_VOLUME/"
-fi
-
-# Set up directory structure
-DIFF_PIPE_DIR="$NETWORK_VOLUME/diffusion_pipe"
-
-# Pull latest changes from diffusion_pipe repository
-if [ -d "$DIFF_PIPE_DIR" ] && [ -d "$DIFF_PIPE_DIR/.git" ]; then
-    echo "Pulling latest changes from diffusion_pipe repository..."
-    cd "$DIFF_PIPE_DIR" || exit 1
-    git pull || echo "Warning: Failed to pull latest changes from diffusion_pipe repository"
-    cd "$NETWORK_VOLUME" || exit 1
-else
-    echo "Warning: diffusion_pipe directory not found or not a git repository. Skipping git pull."
-fi
-
-# Clean up examples and move dataset.toml
-if [ -d "$NETWORK_VOLUME/diffusion_pipe/examples" ]; then
-    rm -rf "$NETWORK_VOLUME/diffusion_pipe/examples"/*
-    if [ -f "$NETWORK_VOLUME/diffusion-pipe-helper/dataset.toml" ]; then
-        mv "$NETWORK_VOLUME/diffusion-pipe-helper/dataset.toml" "$NETWORK_VOLUME/diffusion_pipe/examples/"
+    # Clean up examples and move dataset.toml
+    if [ -d "$NETWORK_VOLUME/diffusion-pipe/examples" ]; then
+        rm -rf "$NETWORK_VOLUME/diffusion-pipe/examples"/*
+        if [ -f "$NETWORK_VOLUME/diffusion-pipe-helper/dataset.toml" ]; then
+            mv "$NETWORK_VOLUME/diffusion-pipe-helper/dataset.toml" "$NETWORK_VOLUME/diffusion-pipe/examples/"
+        fi
     fi
 fi
 
@@ -315,13 +331,13 @@ if [ "$download_triton" == "true" ]; then
 fi
 
 # Create dataset directories in the working directory
-mkdir -p "$NETWORK_VOLUME/image_dataset_here"
-mkdir -p "$NETWORK_VOLUME/video_dataset_here"
+mkdir -p "$NETWORK_VOLUME/image-dataset"
+mkdir -p "$NETWORK_VOLUME/video-dataset"
 mkdir -p "$NETWORK_VOLUME/logs"
-mkdir -p "$NETWORK_VOLUME/training_outputs"
+mkdir -p "$NETWORK_VOLUME/training-outputs"
 # Update dataset.toml path to use the working directory
-if [ -f "$NETWORK_VOLUME/diffusion_pipe/examples/dataset.toml" ]; then
-    sed -i "s|path = '/home/anon/data/images/grayscale'|path = '$NETWORK_VOLUME/image_dataset_here'|" "$NETWORK_VOLUME/diffusion_pipe/examples/dataset.toml"
+if [ -f "$NETWORK_VOLUME/diffusion-pipe/examples/dataset.toml" ]; then
+    sed -i "s|path = '/home/anon/data/images/grayscale'|path = '$NETWORK_VOLUME/image-dataset'|" "$NETWORK_VOLUME/diffusion-pipe/examples/dataset.toml"
 fi
 
 echo "Installing torch"
